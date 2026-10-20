@@ -82,6 +82,12 @@ static HFONT g_fontSmall = nullptr;    // 小字
 static HBRUSH g_bgBrush = nullptr;     // 窗口背景
 static int   g_dpi = 96;
 
+// 双缓冲（复用，避免每帧重建位图导致闪烁/卡顿）
+static HDC     g_memDC = nullptr;
+static HBITMAP g_memBmp = nullptr;
+static HGDIOBJ g_memOldBmp = nullptr;
+static int     g_memW = 0, g_memH = 0;
+
 static Mode      g_mode = MODE_IDLE;
 static long long g_totalMs = 0;        // 总时长（毫秒）
 static long long g_elapsedMs = 0;      // 已过（毫秒）
@@ -124,6 +130,7 @@ static void startCountdown();
 static void togglePause();
 static void resetCountdown();
 static void showMainWindow();
+static void invalidateDynamic(HWND hwnd);
 
 // ---------------------------------------------------------------------------
 //  声音播放（wav / mp3 / 系统别名）
@@ -597,7 +604,7 @@ static void updateUI() {
             SetWindowTextW(g_btnPause, L"暂停");
             break;
     }
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    invalidateDynamic(g_hwnd);
 }
 
 static void updateSoundLabel() {
@@ -625,6 +632,46 @@ static void fillRoundRect(HDC hdc, RECT rc, int radius, COLORREF color) {
     DeleteObject(pen);
 }
 
+// 释放双缓冲资源
+static void releaseBackBuffer() {
+    if (g_memDC) {
+        if (g_memOldBmp) SelectObject(g_memDC, g_memOldBmp);
+        if (g_memBmp) DeleteObject(g_memBmp);
+        DeleteDC(g_memDC);
+    }
+    g_memDC = nullptr;
+    g_memBmp = nullptr;
+    g_memOldBmp = nullptr;
+    g_memW = g_memH = 0;
+}
+
+// 按当前客户区尺寸准备双缓冲（尺寸没变就直接复用）
+static bool ensureBackBuffer(HDC hdcRef, int w, int h) {
+    if (w <= 0 || h <= 0) return false;
+    if (g_memDC && g_memW == w && g_memH == h) return true;
+
+    releaseBackBuffer();
+    g_memDC = CreateCompatibleDC(hdcRef);
+    if (!g_memDC) return false;
+    g_memBmp = CreateCompatibleBitmap(hdcRef, w, h);
+    if (!g_memBmp) {
+        DeleteDC(g_memDC);
+        g_memDC = nullptr;
+        return false;
+    }
+    g_memOldBmp = SelectObject(g_memDC, g_memBmp);
+    g_memW = w;
+    g_memH = h;
+    return true;
+}
+
+// 只需要重绘上半部分的动态内容（大数字 / 副标题 / 进度条 / 分隔线），
+// 下半部分是子控件，不参与父窗口重绘，减少绘制面积
+static void invalidateDynamic(HWND hwnd) {
+    RECT rc{ 0, 0, S(520), S(202) };
+    InvalidateRect(hwnd, &rc, FALSE);
+}
+
 static void paintWindow(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdcReal = BeginPaint(hwnd, &ps);
@@ -633,10 +680,12 @@ static void paintWindow(HWND hwnd) {
     GetClientRect(hwnd, &rcClient);
     int W = rcClient.right, H = rcClient.bottom;
 
-    // 双缓冲，避免闪烁
-    HDC hdc = CreateCompatibleDC(hdcReal);
-    HBITMAP bmp = CreateCompatibleBitmap(hdcReal, W, H);
-    HGDIOBJ oldBmp = SelectObject(hdc, bmp);
+    // 双缓冲：先在内存位图上画完，再一次性贴到屏幕
+    if (!ensureBackBuffer(hdcReal, W, H)) {
+        EndPaint(hwnd, &ps);
+        return;
+    }
+    HDC hdc = g_memDC;
 
     HBRUSH bg = CreateSolidBrush(C_BG);
     FillRect(hdc, &rcClient, bg);
@@ -733,9 +782,6 @@ static void paintWindow(HWND hwnd) {
     }
 
     BitBlt(hdcReal, 0, 0, W, H, hdc, 0, 0, SRCCOPY);
-    SelectObject(hdc, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(hdc);
     EndPaint(hwnd, &ps);
 }
 
@@ -952,7 +998,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 long long remain = (g_totalMs - g_elapsedMs + 999) / 1000;
                 updateTrayTip(remain);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                invalidateDynamic(hwnd);
             }
         }
         return 0;
@@ -987,7 +1033,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         swprintf(buf, 32, L"%lld", (sec % 86400) / 3600); SetWindowTextW(g_edHour, buf);
         swprintf(buf, 32, L"%lld", (sec % 3600) / 60);    SetWindowTextW(g_edMin, buf);
         swprintf(buf, 32, L"%lld", sec % 60);             SetWindowTextW(g_edSec, buf);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        invalidateDynamic(hwnd);
         return 0;
     }
 
@@ -1049,7 +1095,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_popup = (SendMessageW(g_chkPopup, BM_GETCHECK, 0, 0) == BST_CHECKED);
         } else if ((id == ID_EDIT_DAY || id == ID_EDIT_HOUR ||
                     id == ID_EDIT_MIN || id == ID_EDIT_SEC) && code == EN_CHANGE) {
-            if (g_mode == MODE_IDLE) InvalidateRect(hwnd, nullptr, FALSE);
+            if (g_mode == MODE_IDLE) invalidateDynamic(hwnd);
         }
         return 0;
     }
@@ -1065,8 +1111,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd);
         return 0;
 
+    case WM_SIZE:
+        // 尺寸变化时丢弃旧的双缓冲，下次绘制时按新尺寸重建
+        releaseBackBuffer();
+        return 0;
+
     case WM_DESTROY:
         removeTrayIcon();
+        releaseBackBuffer();
         PostQuitMessage(0);
         return 0;
     }
@@ -1126,14 +1178,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     // 窗口尺寸（含边框）
     int w = S(520), h = S(444);
     RECT rc{ 0, 0, w, h };
-    AdjustWindowRectEx(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE, 0);
+    // WS_CLIPCHILDREN：父窗口绘制时跳过子控件区域，避免控件区域被反复覆盖而闪烁
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+    AdjustWindowRectEx(&rc, style, FALSE, 0);
     int ww = rc.right - rc.left, wh = rc.bottom - rc.top;
 
     int x = (GetSystemMetrics(SM_CXSCREEN) - ww) / 2;
     int y = (GetSystemMetrics(SM_CYSCREEN) - wh) / 2;
 
     g_hwnd = CreateWindowExW(0, L"CountdownGuiClass", L"C++ 倒计时器",
-                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+                             style,
                              x, y, ww, wh,
                              nullptr, nullptr, hInst, nullptr);
     if (!g_hwnd) return 1;
